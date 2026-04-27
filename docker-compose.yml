@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+
+  # ── Python AI Service (FastAPI + FAISS + LLM) ─────────────────────────────
+  ai-service:
+    build:
+      context: ./ai-service-python
+      dockerfile: Dockerfile
+    container_name: ai-service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai-service-python/data:/app/data   # persist FAISS index between restarts
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Node.js Backend (Express API Gateway) ────────────────────────────────
+  backend:
+    build:
+      context: ./backend-node
+      dockerfile: Dockerfile
+    container_name: backend
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - AI_SERVICE_URL=http://ai-service:8000
+      - FRONTEND_URL=http://localhost:3000
+    depends_on:
+      ai-service:
+        condition: service_healthy
+
+  # ── React Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend-react
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "3000:80"
+    environment:
+      # Empty string: the React app will call /api/... relative URLs,
+      # which nginx proxies to the backend container.
+      - REACT_APP_API_URL=
+    depends_on:
+      - backend

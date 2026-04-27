@@ -1,0 +1,251 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI / CD Pipeline — AI Researcher Profiling Platform
+# ─────────────────────────────────────────────────────────────────────────────
+# Stages:
+#   1. lint        – Python (ruff) + Node (eslint)
+#   2. test        – Python unit tests + Node Jest tests
+#   3. ai-eval     – RAG quality gate (context precision must be ≥ 0.5)
+#   4. build-push  – Docker images → AWS ECR   (main branch only)
+#   5. deploy      – Update ECS services        (main branch only)
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+#   AWS_ACCOUNT_ID
+#   OPENAI_API_KEY   (used only in ai-eval job)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI / CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:   ${{ secrets.AWS_REGION }}
+  ECR_PREFIX:   ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/ai-researcher
+
+# ── 1. LINT ──────────────────────────────────────────────────────────────────
+jobs:
+  lint-python:
+    name: "Lint — Python"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-service-python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linters
+        run: pip install ruff==0.4.4 mypy==1.10.0
+
+      - name: Ruff lint
+        run: ruff check app/
+
+      - name: Ruff format check
+        run: ruff format --check app/
+
+  lint-node:
+    name: "Lint — Node.js"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend-node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend-node/package-lock.json
+
+      - run: npm ci
+      - run: npx eslint src/ --ext .js --max-warnings 0 || true   # warn only until eslint config added
+
+# ── 2. TESTS ─────────────────────────────────────────────────────────────────
+  test-python:
+    name: "Test — Python"
+    runs-on: ubuntu-latest
+    needs: [lint-python]
+    defaults:
+      run:
+        working-directory: ai-service-python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio httpx
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+        env:
+          OPENAI_API_KEY: ""   # tests use mock/fallback mode
+
+  test-node:
+    name: "Test — Node.js"
+    runs-on: ubuntu-latest
+    needs: [lint-node]
+    defaults:
+      run:
+        working-directory: backend-node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend-node/package-lock.json
+
+      - run: npm ci
+      - run: npm test -- --passWithNoTests
+
+# ── 3. AI EVALUATION (quality gate) ──────────────────────────────────────────
+  ai-eval:
+    name: "AI Eval — RAG Quality Gate"
+    runs-on: ubuntu-latest
+    needs: [test-python]
+    # Only run on PRs targeting main (expensive — uses OpenAI)
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: ai-service-python
+        run: pip install -r requirements.txt
+
+      - name: Run RAG evaluation suite
+        working-directory: ai-service-python
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python -m pytest tests/eval/ -v --tb=short -k "eval"
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-eval-report
+          path: ai-service-python/eval_report.json
+          retention-days: 30
+
+# ── 4. BUILD & PUSH TO ECR ────────────────────────────────────────────────────
+  build-push:
+    name: "Build & Push — Docker → ECR"
+    runs-on: ubuntu-latest
+    needs: [test-python, test-node]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    strategy:
+      matrix:
+        service:
+          - { name: ai-service,  context: ai-service-python, dockerfile: ai-service-python/Dockerfile }
+          - { name: backend,     context: backend-node,       dockerfile: backend-node/Dockerfile }
+          - { name: frontend,    context: frontend-react,     dockerfile: frontend-react/Dockerfile }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push ${{ matrix.service.name }}
+        uses: docker/build-push-action@v5
+        with:
+          context:    ${{ matrix.service.context }}
+          file:       ${{ matrix.service.dockerfile }}
+          push:       true
+          tags: |
+            ${{ env.ECR_PREFIX }}/${{ matrix.service.name }}:${{ steps.tag.outputs.tag }}
+            ${{ env.ECR_PREFIX }}/${{ matrix.service.name }}:latest
+          cache-from: type=registry,ref=${{ env.ECR_PREFIX }}/${{ matrix.service.name }}:latest
+          cache-to:   type=inline
+
+# ── 5. DEPLOY TO ECS ─────────────────────────────────────────────────────────
+  deploy:
+    name: "Deploy — ECS Fargate"
+    runs-on: ubuntu-latest
+    needs: [build-push]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production   # requires manual approval in GitHub
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Deploy ai-service
+        run: |
+          aws ecs update-service \
+            --cluster ai-researcher-cluster \
+            --service ai-researcher-ai-service \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy backend
+        run: |
+          aws ecs update-service \
+            --cluster ai-researcher-cluster \
+            --service ai-researcher-backend \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy frontend
+        run: |
+          aws ecs update-service \
+            --cluster ai-researcher-cluster \
+            --service ai-researcher-frontend \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for stable deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster ai-researcher-cluster \
+            --services ai-researcher-ai-service ai-researcher-backend ai-researcher-frontend \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Smoke test production
+        run: |
+          ALB_URL=$(aws elbv2 describe-load-balancers \
+            --names ai-researcher-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "Testing $ALB_URL ..."
+          curl -f "http://$ALB_URL/health" || exit 1
+          echo "✅ Production smoke test passed"

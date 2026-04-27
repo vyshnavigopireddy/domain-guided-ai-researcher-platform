@@ -1,0 +1,59 @@
+# render.yaml — One-click deployment to Render.com (free tier)
+# ─────────────────────────────────────────────────────────────
+# Deploy with:  render deploy --config deployment/render/render.yaml
+# Or connect your GitHub repo at https://dashboard.render.com
+#
+# Free tier limits:
+#   • Web services: 512 MB RAM, shared CPU, 750 hrs/month
+#   • Services spin down after 15min inactivity (cold start ~30s)
+#   • For always-on, upgrade to Starter ($7/mo per service)
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ── Python AI Service (FastAPI + FAISS + LangGraph) ──────────────────────
+  - type: web
+    name: ai-researcher-ai-service
+    runtime: docker
+    dockerfilePath: ./ai-service-python/Dockerfile
+    dockerContext: ./ai-service-python
+    plan: starter          # upgrade from free for no cold starts
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false        # set manually in Render dashboard (never in git)
+    healthCheckPath: /health
+    autoDeploy: true
+
+  # ── Node.js Backend (Express API Gateway) ────────────────────────────────
+  - type: web
+    name: ai-researcher-backend
+    runtime: docker
+    dockerfilePath: ./backend-node/Dockerfile
+    dockerContext: ./backend-node
+    plan: free
+    envVars:
+      - key: PORT
+        value: "3001"
+      - key: AI_SERVICE_URL
+        fromService:
+          name: ai-researcher-ai-service
+          type: web
+          property: host
+      - key: FRONTEND_URL
+        fromService:
+          name: ai-researcher-frontend
+          type: web
+          property: host
+    healthCheckPath: /health
+    autoDeploy: true
+
+  # ── React Frontend (Nginx) ────────────────────────────────────────────────
+  - type: web
+    name: ai-researcher-frontend
+    runtime: docker
+    dockerfilePath: ./frontend-react/Dockerfile
+    dockerContext: ./frontend-react
+    plan: free
+    envVars:
+      - key: REACT_APP_API_URL
+        value: ""          # relative URLs, proxied by nginx
+    autoDeploy: true
